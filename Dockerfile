@@ -33,7 +33,7 @@ COPY requirements.txt .
 RUN pip install --user --no-cache-dir -r requirements.txt
 
 # Playwright 브라우저 다운로드 (headless chromium만)
-RUN ~/.local/bin/playwright install --with-deps chromium
+RUN ~/.local/bin/playwright install chromium
 
 # =======================
 # 2) Runtime stage
