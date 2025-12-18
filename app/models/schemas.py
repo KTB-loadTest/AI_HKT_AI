@@ -25,6 +25,7 @@ class GenerateTrailerRequest(BaseModel):
     generate_cut_images: bool = False
 
     generate_cut_images: bool = Field(default=False, description="If true, generate cut images with Imagen (non-fatal).")
+    
 class SelectedBook(BaseModel):
     title: str
     author: str
@@ -37,7 +38,9 @@ class SelectedBook(BaseModel):
 class Cut(BaseModel):
     index: int
     scene_en: str
-    image_prompt_en: str
+    video_prompt_en: Optional[str] = None
+    negative_prompt_en: Optional[str] = None
+    duration_seconds: Optional[int] = None
 
 
 class StoryboardLLMOutput(BaseModel):

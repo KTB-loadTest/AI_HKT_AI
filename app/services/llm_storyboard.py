@@ -20,6 +20,11 @@ Rules:
 """
 
 
+
+
+
+
+
 def _client():
     if not settings.GOOGLE_CLOUD_PROJECT:
         raise RuntimeError("GOOGLE_CLOUD_PROJECT not set")

@@ -1,23 +1,21 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
-import logging
-import traceback
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.responses import FileResponse
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
-from starlette.responses import JSONResponse
 
+from app.core.config import settings
 from app.core.logging import setup_logging
 from app.models.schemas import GenerateTrailerRequest
 from app.services.naver import NaverClient, collect_synopsis_links
 from app.services.book_select import choose_best_book
 from app.services.crawler import crawl_synopsis_pages
 from app.services.llm_storyboard import make_storyboard
-from app.services.imagen import generate_cut_images_to_dir  # discard는 이제 호출 안 함
-from app.services.veo import generate_cut_clip_bytes  # ✅ 컷 단위 생성 함수로 교체
+from app.services.veo import generate_cut_clip_bytes
 from app.services.tts import synthesize_narration_mp3_bytes
 from app.services.storage import create_job_dir, write_bytes, cleanup_job_dir
 from app.services.ffmpeg_video import concat_and_trim
@@ -26,12 +24,9 @@ from app.services.ffmpeg_mux import mux_video_audio
 setup_logging()
 log = logging.getLogger("book-trailer-ai")
 
-app = FastAPI(title="book-trailer-ai (mp4 direct response)")
+app = FastAPI(title="book-trailer-ai")
 
 
-# =========================
-# Logging helpers (STEP3/4 artifacts)
-# =========================
 def _log_multiline(prefix: str, text: str, limit: int = 1200) -> None:
     if not text:
         log.info("%s <empty>", prefix)
@@ -42,81 +37,77 @@ def _log_multiline(prefix: str, text: str, limit: int = 1200) -> None:
         t = t[:limit] + f"\n...(truncated {len(text) - limit} chars)"
 
     for line in t.splitlines():
-        line = line.strip()
-        if line:
-            log.info("%s %s", prefix, line)
+        if line.strip():
+            log.info("%s %s", prefix, line.strip())
 
 
-def log_step3_artifacts(
-    corpus: str,
-    sources: list,
-    corpus_preview_chars: int = 1200,
-    max_sources: int = 8,
-) -> None:
-    log.info("STEP 3 ARTIFACTS: corpus_len=%d | sources=%d", len(corpus or ""), len(sources or []))
-    _log_multiline("STEP3 corpus>>", corpus, limit=corpus_preview_chars)
-
-    if sources:
-        log.info("STEP3 sources>> (showing up to %d)", max_sources)
-        for i, s in enumerate(sources[:max_sources], start=1):
-            log.info("STEP3 source[%d] %s", i, s)
+def _is_rai_filtered_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return ("rai" in m) or ("filtered" in m) or ("raimediafiltered" in m)
 
 
-def log_step4_artifacts(
-    storyboard,
-    max_cuts: int = 8,
-    synopsis_limit: int = 1200,
-    narration_limit: int = 600,
-    video_prompt_limit: int = 220,
-) -> None:
-    cuts = getattr(storyboard, "cuts", []) or []
-    narration = getattr(storyboard, "narration_script", "") or ""
-
-    log.info("STEP 4 ARTIFACTS: cuts=%d | narration_len=%d", len(cuts), len(narration))
-
-    _log_multiline("STEP4 synopsis_ko>>", getattr(storyboard, "synopsis_ko", "") or "", limit=synopsis_limit)
-    _log_multiline("STEP4 synopsis_en>>", getattr(storyboard, "synopsis_en", "") or "", limit=synopsis_limit)
-    _log_multiline("STEP4 narration>>", narration, limit=narration_limit)
-
-    log.info("STEP4 cuts>> (showing up to %d)", max_cuts)
-    for c in cuts[:max_cuts]:
-        idx = getattr(c, "index", None)
-        scene = getattr(c, "scene_en", "") or ""
-        vp = getattr(c, "video_prompt_en", "") or ""
-        neg = getattr(c, "negative_prompt_en", "") or ""
-        dur = getattr(c, "duration_seconds", None)
-
-        log.info("CUT #%s duration=%s scene_en=%s", idx, dur, scene)
-        if vp:
-            preview = vp[:video_prompt_limit] + ("...(trunc)" if len(vp) > video_prompt_limit else "")
-            log.info("CUT #%s video_prompt_en=%s", idx, preview)
-        else:
-            log.info("CUT #%s video_prompt_en=<empty>", idx)
-
-        if neg:
-            log.info("CUT #%s negative_prompt_en=%s", idx, neg)
+def _clean_negative_prompt(neg: str | None) -> str | None:
+    t = (neg or "").strip()
+    return t or None
 
 
-# =========================
-# API
-# =========================
-@app.post("/api/v1/trailer:generate")
-async def generate_trailer(req: GenerateTrailerRequest, bg: BackgroundTasks):
+def _soften_video_prompt(original: str, max_chars: int = 420, strength: str = "normal") -> str:
     """
-    Returns: video/mp4 (binary)
+    Veo RAI에 덜 걸리도록 프롬프트를 '안전/평화/비폭력' 톤으로 완화.
+    - normal: 기본 완화(품질 유지)
+    - strong: 더 강한 완화(필터 걸렸을 때 재시도용)
     """
-    log.info("STEP 0: request received")
+    core = (original or "").strip()
 
+    if strength == "strong":
+        safe_prefix = (
+            "Ultra family-friendly, cheerful, cozy cinematic scene. "
+            "Soft pastel lighting, gentle slow camera movement, calm wholesome mood. "
+            "Absolutely no violence, no weapons, no blood, no injury, no fear, no threats, no crime, "
+            "no conflict, no chasing, no falling, no danger, no scary imagery. "
+            "Only peaceful actions like walking, smiling, looking around, reading, holding hands, "
+            "breathing calmly, enjoying nature. "
+            "No on-screen text, no subtitles, no captions, no speech bubbles, no logos, no watermarks, "
+            "no UI overlays. "
+        )
+    else:
+        safe_prefix = (
+            "Family-friendly, calm, heartwarming cinematic scene. "
+            "Gentle atmosphere, cozy mood, soft lighting, smooth camera motion. "
+            "No violence, no weapons, no blood, no injury, no fear, no threats, no crime. "
+            "No scary imagery. "
+            "No on-screen text, no subtitles, no captions, no speech bubbles, no logos, no watermarks, "
+            "no UI overlays. "
+        )
+
+    out = (safe_prefix + core).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip()
+    return out
+
+
+@app.post("/api/v1/trailer/jobs")
+async def create_trailer_job(req: GenerateTrailerRequest, bg: BackgroundTasks):
+    log.info("REQUEST | title=%s | author=%s", req.title, req.author)
     job_dir = create_job_dir()
-    log.info("JOB START | job_dir=%s | title=%s | author=%s", job_dir, req.title, req.author)
 
     try:
-        # STEP 1 ─ Naver book search
-        log.info("STEP 1: Naver book search")
+        # ----- defaults -----
+        top_n_books = settings.DEFAULT_TOP_N_BOOKS
+        max_synopsis_pages = settings.DEFAULT_MAX_SYNOPSIS_PAGES
+        crawl_timeout_sec = settings.DEFAULT_CRAWL_TIMEOUT_SEC
+        clip_duration = settings.DEFAULT_CLIP_DURATION_SECONDS  # <- 4 유지
+        target_seconds = settings.DEFAULT_TARGET_SECONDS
+        aspect_ratio = settings.DEFAULT_ASPECT_RATIO
+        resolution = settings.DEFAULT_RESOLUTION
+        fps = settings.DEFAULT_FPS
+        requested_cut_count = settings.DEFAULT_CUT_COUNT
+
+        # STEP 1 ─ Naver search
         naver = NaverClient()
         book_json = await naver.search_books(
             f"{req.title} {req.author}",
-            display=req.top_n_books,
+            display=top_n_books,
         )
 
         selected = choose_best_book(
@@ -124,10 +115,8 @@ async def generate_trailer(req: GenerateTrailerRequest, bg: BackgroundTasks):
             req.title,
             req.author,
         )
-        log.info("STEP 1 DONE: selected book = %s / %s", selected.title, selected.author)
 
-        # STEP 2 ─ Collect synopsis links
-        log.info("STEP 2: Collect synopsis links from Naver")
+        # STEP 2 ─ synopsis links
         links = await collect_synopsis_links(
             naver=naver,
             title=selected.title,
@@ -135,183 +124,153 @@ async def generate_trailer(req: GenerateTrailerRequest, bg: BackgroundTasks):
             per_query_display=30,
             max_links=30,
         )
-
         if not links:
-            raise HTTPException(status_code=404, detail="No synopsis pages found")
+            raise HTTPException(status_code=404)
 
-        log.info("STEP 2 DONE: collected %d links", len(links))
-
-        # STEP 3 ─ Crawl synopsis pages
-        log.info(
-            "STEP 3: Crawl synopsis pages (max_pages=%d, timeout=%ds)",
-            req.max_synopsis_pages,
-            req.crawl_timeout_sec,
-        )
-
+        # STEP 3 ─ crawl
         corpus, sources = await crawl_synopsis_pages(
             urls=links,
-            max_pages=req.max_synopsis_pages,
-            timeout_sec=req.crawl_timeout_sec,
+            max_pages=max_synopsis_pages,
+            timeout_sec=crawl_timeout_sec,
         )
-
         if not corpus.strip():
-            raise HTTPException(status_code=422, detail="Extracted synopsis corpus is empty")
+            raise HTTPException(status_code=422)
 
-        log.info("STEP 3 DONE: corpus length=%d chars | sources=%d", len(corpus), len(sources))
-
-        log_step3_artifacts(
-            corpus=corpus,
-            sources=sources,
-            corpus_preview_chars=1200,
-            max_sources=8,
-        )
-
-        # ---- clip planning ----
-        clip_duration = int(getattr(req, "clip_duration_seconds", 4) or 4)
-        target_seconds = int(getattr(req, "target_seconds", 30) or 30)
+        # STEP 4 ─ cut planning
         required_cuts = max(1, math.ceil(target_seconds / clip_duration))
-
-        # req.cut_count가 부족하면 30초를 채울 수 없으므로 자동 상향
-        requested_cut_count = int(getattr(req, "cut_count", required_cuts) or required_cuts)
         cut_count = max(requested_cut_count, required_cuts)
 
-        if cut_count != requested_cut_count:
-            log.info(
-                "CUT COUNT ADJUSTED: requested=%d, required=%d (target=%ds, clip=%ds) -> using=%d",
-                requested_cut_count,
-                required_cuts,
-                target_seconds,
-                clip_duration,
-                cut_count,
-            )
+        log.info(
+            "STEP 4: cut plan | target_seconds=%d clip_duration=%d required_cuts=%d requested_cut_count=%d final_cut_count=%d",
+            target_seconds, clip_duration, required_cuts, requested_cut_count, cut_count
+        )
 
-        # STEP 4 ─ LLM storyboard (Veo-ready)
-        log.info("STEP 4: Generate storyboard (cuts=%d, clip_duration=%ds)", cut_count, clip_duration)
         storyboard = await make_storyboard(
             corpus,
-            cut_count=req.cut_count,
-            target_seconds=req.target_seconds,          # ✅ 추가
-            clip_duration_seconds=req.clip_duration_seconds,
+            cut_count=cut_count,
+            target_seconds=target_seconds,
+            clip_duration_seconds=clip_duration,
         )
 
-        log.info("STEP 4 DONE: cuts=%d | narration_len=%d", len(storyboard.cuts), len(storyboard.narration_script))
-
-        log_step4_artifacts(
-            storyboard=storyboard,
-            max_cuts=min(len(storyboard.cuts), 8),
-        )
-
-        # STEP 5 ─ Optional Imagen (generate_cut_images=false면 절대 호출 X)
-        if bool(getattr(req, "generate_cut_images", False)):
-            log.info("STEP 5: Generate cut images (Imagen)")
-            try:
-                out_dir = os.path.join(job_dir, "imagen_cuts")
-                paths = await generate_cut_images_to_dir(
-                    storyboard.cuts,
-                    out_dir=out_dir,
-                    generate_images=True,  # ✅ 명시
-                )
-                log.info("STEP 5 DONE: saved %d pngs to %s", len(paths), out_dir)
-            except Exception:
-                log.warning("STEP 5 FAILED: Imagen error (ignored)", exc_info=True)
-        else:
-            log.info("STEP 5 SKIPPED: generate_cut_images=false")
-
-        # STEP 6 ─ Veo clip generation (컷마다 4초씩)
         log.info(
-            "STEP 6: Generate Veo clips per cut | cuts=%d | duration=%ds",
+            "STEP 4 DONE: storyboard received | cuts=%d (expected=%d) narration_chars=%d",
             len(storyboard.cuts),
-            clip_duration,
+            cut_count,
+            len(storyboard.narration_script or "")
         )
 
+        # STEP 5 ─ Veo clips
+        log.info("STEP 5 START: generating veo clips | cuts=%d", len(storyboard.cuts))
         clip_paths: list[str] = []
 
         for i, cut in enumerate(storyboard.cuts, start=1):
-            log.info("STEP 6.%d: Veo cut clip START", i)
+            log.info("STEP 5.%d/%d: Veo request start", i, len(storyboard.cuts))
 
-            video_prompt = (getattr(cut, "video_prompt_en", "") or "").strip()
-            if not video_prompt:
-                # 비어 있으면 scene_en으로라도 채움
-                video_prompt = (getattr(cut, "scene_en", "") or "").strip()
+            raw_prompt = (cut.video_prompt_en or cut.scene_en or "").strip()
+            if not raw_prompt:
+                raw_prompt = "A calm, heartwarming cinematic scene."
 
-            negative_prompt = (getattr(cut, "negative_prompt_en", "") or "").strip() or None
-            dur = int(getattr(cut, "duration_seconds", clip_duration) or clip_duration)
+            # ✅ 항상 기본 완화 프롬프트로 1차 시도
+            video_prompt = _soften_video_prompt(raw_prompt, strength="normal")
+            negative_prompt = _clean_negative_prompt(getattr(cut, "negative_prompt_en", None))
+            dur = int(clip_duration)
+
+            log.info(
+                "STEP 5.%d/%d: prompt lens | raw=%d softened=%d dur=%ds",
+                i, len(storyboard.cuts), len(raw_prompt), len(video_prompt), dur
+            )
 
             try:
                 clip_bytes = await generate_cut_clip_bytes(
                     video_prompt_en=video_prompt,
                     negative_prompt_en=negative_prompt,
-                    aspect_ratio=req.aspect_ratio,
-                    resolution=req.resolution,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
                     duration_seconds=dur,
-                    fps=req.fps,
+                    fps=fps,
                 )
-            except RuntimeError as e:
-                msg = str(e)
-                if ("filtered" in msg.lower()) or ("rai" in msg.lower()) or ("raimediafiltered" in msg.lower()):
-                    log.warning("STEP 6.%d FAILED: Veo RAI filtered: %s", i, msg)
-                    raise HTTPException(status_code=422, detail=f"Veo output filtered (RAI). {msg}")
-                raise
+            except RuntimeError as exc:
+                msg = str(exc)
+                if _is_rai_filtered_error(msg):
+                    log.warning("STEP 5.%d/%d: Veo RAI filtered on softened(normal): %s", i, len(storyboard.cuts), msg)
 
+                    # ✅ 2차: 더 강한 완화 프롬프트로 재시도
+                    video_prompt_strong = _soften_video_prompt(raw_prompt, strength="strong")
+                    log.info(
+                        "STEP 5.%d/%d: retry with softened(strong) (len=%d)",
+                        i, len(storyboard.cuts), len(video_prompt_strong)
+                    )
+
+                    try:
+                        clip_bytes = await generate_cut_clip_bytes(
+                            video_prompt_en=video_prompt_strong,
+                            negative_prompt_en=negative_prompt,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                            duration_seconds=dur,
+                            fps=fps,
+                        )
+                    except RuntimeError as exc2:
+                        msg2 = str(exc2)
+                        if _is_rai_filtered_error(msg2):
+                            log.warning("STEP 5.%d/%d: Veo RAI filtered again (strong): %s", i, len(storyboard.cuts), msg2)
+                            raise HTTPException(status_code=422, detail=f"Veo output filtered (RAI). {msg2}")
+                        raise
+                else:
+                    raise
+
+            log.info("STEP 5.%d/%d: Veo clip saved | bytes=%d", i, len(storyboard.cuts), len(clip_bytes))
             clip_path = os.path.join(job_dir, f"cut_{i:02d}.mp4")
             write_bytes(clip_path, clip_bytes)
             clip_paths.append(clip_path)
 
-            log.info("STEP 6.%d DONE: clip saved (%s, %d bytes)", i, clip_path, len(clip_bytes))
+        log.info("STEP 5 DONE: veo clips generated | clips=%d", len(clip_paths))
 
-        # STEP 7 ─ ffmpeg concat + trim
-        log.info("STEP 7: ffmpeg concat + trim (target=%ds)", target_seconds)
+        # STEP 6 ─ concat + trim
         merged_path = os.path.join(job_dir, f"merged_{target_seconds}s.mp4")
-        concat_and_trim(clip_paths, target_seconds=target_seconds, out_path=merged_path)
-        log.info("STEP 7 DONE: merged video = %s", merged_path)
+        concat_and_trim(clip_paths, merged_path, target_seconds)
 
-        # STEP 8 ─ TTS
-        log.info("STEP 8: TTS narration")
-        mp3_bytes = await synthesize_narration_mp3_bytes(storyboard.narration_script)
+        # STEP 7 ─ TTS
+        mp3_bytes = await synthesize_narration_mp3_bytes(
+            storyboard.narration_script,
+            target_seconds,
+        )
         audio_path = os.path.join(job_dir, "narration.mp3")
         write_bytes(audio_path, mp3_bytes)
-        log.info("STEP 8 DONE: narration saved (%d bytes)", len(mp3_bytes))
 
-        # STEP 9 ─ mux video + audio
-        log.info("STEP 9: ffmpeg mux video + audio")
-        muxed_path = os.path.join(job_dir, f"final_{target_seconds}s.mp4")
-        mux_video_audio(merged_path, audio_path, target_seconds=target_seconds, out_path=muxed_path)
-        log.info("STEP 9 DONE: final mp4 = %s", muxed_path)
-
-        # cleanup after response
-        bg.add_task(cleanup_job_dir, job_dir)
-
-        final_name = (
-            f"{req.title}_trailer_{target_seconds}s.mp4".replace(" ", "_")
-            if (req.title or "").strip()
-            else f"trailer_{target_seconds}s.mp4"
+        # STEP 8 ─ mux
+        final_path = os.path.join(job_dir, f"final_{target_seconds}s.mp4")
+        mux_video_audio(
+            merged_path,
+            audio_path,
+            final_path,
+            target_seconds,
         )
 
-        log.info("JOB DONE | returning mp4")
+        bg.add_task(cleanup_job_dir, job_dir)
+
+        filename = f"{req.title}_trailer_{target_seconds}s.mp4".replace(" ", "_")
         return FileResponse(
-            path=muxed_path,
+            path=final_path,
             media_type="video/mp4",
-            filename=final_name,
+            filename=filename,
             background=bg,
         )
 
+    except HTTPException:
+        bg.add_task(cleanup_job_dir, job_dir)
+        raise
     except Exception:
         log.exception("JOB FAILED")
         bg.add_task(cleanup_job_dir, job_dir)
-        raise
+        raise HTTPException(status_code=500)
 
 
 @app.exception_handler(FastAPIHTTPException)
-async def http_exception_handler(request, exc: FastAPIHTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-    )
+async def http_exception_handler(_, exc: FastAPIHTTPException):
+    return Response(status_code=exc.status_code)
 
 
 @app.exception_handler(Exception)
-async def unhandled_exception_handler(request, exc: Exception):
-    return JSONResponse(
-        status_code=500,
-        content={"detail": str(exc), "trace": traceback.format_exc()},
-    )
+async def unhandled_exception_handler(_, __):
+    return Response(status_code=500)
