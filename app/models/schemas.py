@@ -21,11 +21,7 @@ class GenerateTrailerRequest(BaseModel):
     # final length
     target_seconds: int = Field(30, ge=10, le=60)
 
-    # optional: generate images (not returned)
-    generate_cut_images: bool = False
-
-    generate_cut_images: bool = Field(default=False, description="If true, generate cut images with Imagen (non-fatal).")
-    
+  
 class SelectedBook(BaseModel):
     title: str
     author: str

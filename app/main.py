@@ -4,7 +4,7 @@ import logging
 import math
 import os
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, Request
 from fastapi.responses import FileResponse
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 
@@ -87,7 +87,14 @@ def _soften_video_prompt(original: str, max_chars: int = 420, strength: str = "n
 
 
 @app.post("/api/v1/trailer/jobs")
-async def create_trailer_job(req: GenerateTrailerRequest, bg: BackgroundTasks):
+async def create_trailer_job(request: Request, req: GenerateTrailerRequest, bg: BackgroundTasks):
+    content_type = request.headers.get("content-type", "<unknown>")
+    log.info(
+        "REQUEST START | method=%s path=%s content-type=%s",
+        request.method,
+        request.url.path,
+        content_type,
+    )
     log.info("REQUEST | title=%s | author=%s", req.title, req.author)
     job_dir = create_job_dir()
 
