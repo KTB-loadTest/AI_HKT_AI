@@ -1,4 +1,4 @@
-name: AI FastApi CI/CD
+name: FastApi CI/CD
 
 on:
   push:
