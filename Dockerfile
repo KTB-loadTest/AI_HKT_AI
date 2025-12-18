@@ -46,6 +46,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Runtime에 필요한 의존성 (libgbm1 추가)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    ffmpeg \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
