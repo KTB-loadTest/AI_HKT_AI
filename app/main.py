@@ -21,6 +21,9 @@ from app.services.storage import create_job_dir, write_bytes, cleanup_job_dir
 from app.services.ffmpeg_video import concat_and_trim
 from app.services.ffmpeg_mux import mux_video_audio
 
+
+print("ddd")
+
 setup_logging()
 log = logging.getLogger("book-trailer-ai")
 
@@ -90,7 +93,7 @@ def _soften_video_prompt(original: str, max_chars: int = 420, strength: str = "n
 async def create_trailer_job(req: GenerateTrailerRequest, bg: BackgroundTasks, request: Request):
     
     raw = await request.body()
-    log.info("RAW BODY bytes=%d text=%s", len(raw), raw.decode("utf-8", errors="replace"))
+    print("RAW BODY bytes=%d text=%s", len(raw), raw.decode("utf-8", errors="replace"))
     log.info("PARSED | title=%s | author=%s", req.title, req.author)
     #log.info("REQUEST | title=%s | author=%s", req.title, req.author)
     job_dir = create_job_dir()

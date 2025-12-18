@@ -10,7 +10,7 @@ class GenerateTrailerRequest(BaseModel):
     max_synopsis_pages: int = Field(8, ge=1, le=30)
     crawl_timeout_sec: int = Field(15, ge=5, le=60)
 
-    cut_count: int = Field(8, ge=3, le=15)
+    cut_count: int = Field(4, ge=3, le=15)
 
     # Veo Fast clips
     clip_duration_seconds: int = Field(8, ge=4, le=8)
@@ -19,7 +19,7 @@ class GenerateTrailerRequest(BaseModel):
     resolution: str = Field("720p")
 
     # final length
-    target_seconds: int = Field(30, ge=10, le=60)
+    target_seconds: int = Field(32, ge=10, le=60)
 
   
 class SelectedBook(BaseModel):
