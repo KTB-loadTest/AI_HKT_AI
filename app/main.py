@@ -125,7 +125,10 @@ async def create_trailer_job(req: GenerateTrailerRequest, bg: BackgroundTasks):
             max_links=30,
         )
         if not links:
-            raise HTTPException(status_code=404)
+            raise HTTPException(
+                status_code=404, 
+                detail="No link exist"
+            )
 
         # STEP 3 ─ crawl
         corpus, sources = await crawl_synopsis_pages(
@@ -134,7 +137,12 @@ async def create_trailer_job(req: GenerateTrailerRequest, bg: BackgroundTasks):
             timeout_sec=crawl_timeout_sec,
         )
         if not corpus.strip():
-            raise HTTPException(status_code=422)
+            raise HTTPException(
+                status_code=422,
+                detail="Crawling Error: no usable synopsis text extracted"
+            
+            )
+
 
         # STEP 4 ─ cut planning
         required_cuts = max(1, math.ceil(target_seconds / clip_duration))

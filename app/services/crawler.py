@@ -1,3 +1,13 @@
+"""
+Playwright : 실제 브라우저로 페이지 열어 JS 렌더링까지 반영한 HTML 얻음 -> 동적 페이지에서 본문 뽑기 가능
+readability : 복잡한 HTML에서 본문만 추출
+BeautifulSoup : 추출된 HTML에서 태그 제거 후 텍스트만 뽑기
+
+
+"""
+
+
+
 from __future__ import annotations
 
 from typing import List, Tuple
@@ -76,5 +86,5 @@ async def crawl_synopsis_pages(
         await context.close()
         await browser.close()
 
-    corpus = "\n\n---\n\n".join(corpus_parts).strip()
+    corpus = "\n\n---\n\n".join(corpus_parts)
     return corpus, sources
